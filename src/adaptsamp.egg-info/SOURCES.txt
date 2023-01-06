@@ -1,0 +1,13 @@
+LICENSE
+README.md
+setup.py
+src/adaptsamp/__init__.py
+src/adaptsamp/adaptive_sampling.py
+src/adaptsamp/resonance_interpolation.py
+src/adaptsamp/sampler1d.py
+src/adaptsamp/sampler2d.py
+src/adaptsamp.egg-info/PKG-INFO
+src/adaptsamp.egg-info/SOURCES.txt
+src/adaptsamp.egg-info/dependency_links.txt
+src/adaptsamp.egg-info/requires.txt
+src/adaptsamp.egg-info/top_level.txt
