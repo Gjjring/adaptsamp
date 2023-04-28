@@ -73,6 +73,8 @@ class Interval2D():
           the y positions
         f, np.array(7,) float:
           the evaluated function values
+        hash_map, dict:
+          hash of the x,y points for faster comparisons
 
         2
         ##
@@ -132,6 +134,14 @@ class Interval2D():
         self.hash_map = hash_map
 
     def estimate_three_point(self):
+        estimate = 0.
+        t_index = self.big_triangle()[0,:]
+        triangle = Triangle(self.x[t_index], self.y[t_index])            
+        area = triangle.area()
+        estimate = (np.sum(self.f[t_index])/3)*area
+        return estimate
+        
+    def estimate_six_point(self):
         estimate = 0.
         triangles = self.small_triangles()
         for row in range(triangles.shape[0]):
@@ -233,6 +243,7 @@ class AdaptiveSampler2D():
         
         self.n_parallel = n_parallel
         self.intervals = []
+        self.errors = []
         self.n_evaluations = 0
         self.global_hash_map = {}
         self.point_array = np.empty((0, 2))
@@ -316,6 +327,53 @@ class AdaptiveSampler2D():
         #self.intervals = [Interval(x_init, y_init)]
         #self.errors = [self.intervals[0].estimate_error()]
 
+    def init_intervals_triangle(self):
+        points = np.array([[self.x_max, self.y_min],
+                           [self.x_max, self.y_max],
+                           [self.x_min, self.y_min]])
+        f = np.full(3, np.nan)
+        interval0 = Interval2D.from_outer_triangle(points[:,0], points[:,1], f)
+
+        n_initial_points = 7 
+
+        hash_list, init_points = self.get_unique_points([interval0])
+        print(len(hash_list))
+        
+        f = self.evaluate_function(init_points[:,0], init_points[:,1])        
+        self.update_global_maps(hash_list, init_points, f)        
+        print(len(self.global_hash_map))
+        self.n_evaluations += f.shape[0]
+        self.intervals = []
+        self.errors = []
+                
+        self.update_intervals([interval0], hash_list, f)
+        for interval in [interval0]:
+            self.intervals.append(interval)
+            self.errors.append(interval.estimate_error())
+
+
+    def init_from_intervals(self, interval_arrays):
+        points = []
+        f_vals = []
+        for int_array in interval_arrays:
+            x = int_array[:, 0]
+            y = int_array[:, 1]
+            xy = int_array[:, :2]
+            #points.append(xy)
+            f_vals = int_array[:, 2]
+            #f_vals.append(f_vals)
+            #points = np.vstack(points)
+            #f_vals = np.array(f_vals)
+            interval = Interval2D(x, y, f_vals)
+            hash_list, new_points = self.get_unique_points([interval])
+            sliced_f_vals = f_vals[list(interval.hash_map.values())]
+            
+            
+            self.update_global_maps(hash_list, new_points, sliced_f_vals)
+            self.update_intervals([interval], hash_list, sliced_f_vals)
+            self.intervals.append(interval)
+            self.errors.append(interval.estimate_error())
+
     def evaluate_function(self, x, y):
         return self.function(x, y)
 
@@ -327,33 +385,48 @@ class AdaptiveSampler2D():
         remaining_budget = self.max_func - n_evaluations
         #print("initial remaining budget: {}".format(remaining_budget))
         step = 0
+        debug = False
         while remaining_budget > 0:
             print("########## Step {} #############".format(step))
             error_array = np.array(self.errors)
-            #print("error array: {}".format(error_array))
+            if debug:
+                print("error array: {}".format(error_array))
+                print("n intervals: {}".format(len(self.intervals)))                
             sort_args = np.argsort(error_array)[::-1]
             self.intervals = np.array(self.intervals)[sort_args].tolist()
             max_evaluations = np.min([n_parallel, remaining_budget])
-            #print("max_evaluations: {}".format(max_evaluations))
+            if debug:
+                print("max_evaluations: {}".format(max_evaluations))
             total_hash_list = []
             total_to_evaluate = np.empty((0,2))
             total_new_intervals = []
             for i_int in range(len(self.intervals)):
-                #print("i : {}".format(i_int))
+                if debug:
+                    print("i : {}".format(i_int))
                 interval = self.intervals[i_int]
                 #interval = self.intervals.pop(0)
                 new_intervals = interval.split()
                 #self.intervals.extend(new_intervals)
-                hash_list, to_evaluate = self.get_unique_points(new_intervals)
-                #print("new_points_required: {}, max_evals: {}".format(len(total_hash_list) + len(hash_list), max_evaluations))
+                if debug:
+                    print("len(new_intervals): {}".format(len(new_intervals)))
+                candidate_new_intervals = total_new_intervals + new_intervals
+                hash_list, to_evaluate = self.get_unique_points(candidate_new_intervals)
+                #print("hash list: {}".format(hash_list))
+                for hash_val in hash_list:
+                    if hash_val in self.global_hash_map:
+                        print("doubled hash value: {}".format(hash_val))
+                if debug:
+                    print("new_points_required: {}, max_evals: {}".format(len(total_hash_list) + len(hash_list), max_evaluations))
                 if len(total_hash_list) + len(hash_list) > max_evaluations:
                     i_int -= 1
-                    #print("cannot split interval, too few evaluations")
+                    print("cannot split interval, too few evaluations")
                     break
-                total_new_intervals += new_intervals
-                total_hash_list += hash_list
-                total_to_evaluate = np.vstack([total_to_evaluate, to_evaluate])
-                if len(total_hash_list) >= max_evaluations:                    
+                total_new_intervals = candidate_new_intervals
+                total_hash_list = hash_list                
+                total_to_evaluate = to_evaluate
+                if len(total_hash_list) > max_evaluations:
+                    i_int -= 1
+                    print("hash list larger than max evaluations")
                     break
             if len(total_hash_list) == 0:
                 print("not enough parallel evaluations allowed, need at least {} for refinemnet".format(len(hash_list)))                
@@ -368,12 +441,17 @@ class AdaptiveSampler2D():
                 for j in range(i_int+1):
                     self.intervals.pop(0)
                 #print("# new intervals: {}".format(len(total_new_intervals)))
+                print("len(total_new_intervals): {}".format(len(total_new_intervals)))                
                 self.intervals.extend(total_new_intervals)
             #to_evaluate = np.array(to_evaluate)
             f_vals = self.evaluate_function(total_to_evaluate[:,0], total_to_evaluate[:,1])
             self.n_evaluations += f_vals.shape[0]
-
-            self.update_global_maps(total_hash_list, total_to_evaluate, f_vals)            
+            if debug:
+                print("len(global_hash): {}".format(len(self.global_hash_map)))                
+                print("len total hash list: {}".format(len(total_hash_list)))
+            self.update_global_maps(total_hash_list, total_to_evaluate, f_vals)
+            if debug:
+                print("len(global_hash): {}".format(len(self.global_hash_map)))
             self.update_intervals(total_new_intervals, total_hash_list, f_vals)
             
             errors = np.zeros(len(self.intervals))
@@ -460,6 +538,12 @@ class AdaptiveSampler2D():
                     values[ix] = interval.interpolate(xy)
                     break
         return values
+
+    def integrate(self):
+        value = 0.
+        for i_int, interval in enumerate(self.intervals):
+            value += interval.estimate_seven_point()
+        return value
         
     def get_error_distribution(self):        
         points = []
