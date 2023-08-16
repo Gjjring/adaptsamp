@@ -1,6 +1,7 @@
 import numpy as np
 import itertools
 import scipy.spatial
+from rtree import index as rindex 
 
 class Triangle():
     
@@ -63,7 +64,7 @@ class Triangle():
     
 class Interval2D():
 
-    def __init__(self, x, y, f):
+    def __init__(self, x, y, f, error_func=None):
         """
         evaluate the trapz and simpsons error on a seven point triangle
 
@@ -91,8 +92,10 @@ class Interval2D():
         self.y = y
         self.f = f
         self.hash_points()
+        self.error_func = error_func
         #self.triangles = self.triangulate()
 
+        
     @classmethod
     def from_outer_triangle(interval, x, y, f):
         points = np.vstack([x, y]).T
@@ -125,6 +128,13 @@ class Interval2D():
     def big_triangle(self):
         return np.array([[0, 1, 2]])
 
+    def bounding_box(self):
+        x_min = np.amin(self.x)
+        x_max = np.amax(self.x)
+        y_min = np.amin(self.y)
+        y_max = np.amax(self.y)
+        return (x_min, y_min, x_max, y_max)
+
     def hash_points(self):
         hash_map = {}
         for row in range(self.x.size):
@@ -132,6 +142,12 @@ class Interval2D():
             str_val = "{}".format(point.tolist())
             hash_map[hash(str_val)] = row
         self.hash_map = hash_map
+
+    def area(self):
+        t_index = self.big_triangle()[0,:]
+        triangle = Triangle(self.x[t_index], self.y[t_index])            
+        area = triangle.area()
+        return area
 
     def estimate_three_point(self):
         estimate = 0.
@@ -162,7 +178,13 @@ class Interval2D():
         return estimate
 
     def estimate_error(self):
-        return  np.abs(self.estimate_seven_point()-self.estimate_three_point())
+        if self.error_func is None:
+            return self._estimate_error()
+        else:
+            return self.error_func(self)
+
+    def _estimate_error(self):
+        return np.abs(self.estimate_seven_point()-self.estimate_three_point())
 
     def split(self):
         intervals = []
@@ -171,8 +193,10 @@ class Interval2D():
             t_index = triangles[row, :]
             x = self.x[t_index]
             y = self.y[t_index]
-            f = self.f[t_index]            
-            intervals.append(Interval2D.from_outer_triangle(x, y, f))            
+            f = self.f[t_index]
+            interval = Interval2D.from_outer_triangle(x, y, f)
+            interval.error_func = self.error_func
+            intervals.append(interval)
             
         return intervals
 
@@ -228,7 +252,7 @@ class Interval2D():
 class AdaptiveSampler2D():
 
     def __init__(self, function, x_min, x_max, y_min, y_max, tol=1e-3, max_func=100,
-                 n_parallel=1):
+                 n_parallel=1, error_func=None, strategy='mix'):
         self.function = function                             
         self.x_min = x_min
         self.x_max = x_max                             
@@ -240,14 +264,16 @@ class AdaptiveSampler2D():
         if max_func < 11:
             raise ValueError("Sampler requires at least 11 function evaluations")
         self.max_func = max_func
-        
+        self.strategy = strategy
         self.n_parallel = n_parallel
         self.intervals = []
         self.errors = []
+        self.areas = []
         self.n_evaluations = 0
         self.global_hash_map = {}
         self.point_array = np.empty((0, 2))
         self.f = np.empty((0,))
+        self.error_func = error_func
         #self.init_intervals()
         #self.refine_intervals()
 
@@ -277,7 +303,7 @@ class AdaptiveSampler2D():
 
         self.f = np.hstack([self.f, f_vals])
 
-    def update_intervals(self, intervals, hash_list, f_vals):
+    def update_intervals(self, intervals):
         #print("intervals: {}".format(len(intervals)))
         #print("hash_list: {}".format(hash_list))
         #print("f_vals: {}".format(f_vals))
@@ -296,12 +322,14 @@ class AdaptiveSampler2D():
                            [self.x_min, self.y_max]])
         f = np.full(3, np.nan)
         interval0 = Interval2D.from_outer_triangle(points[:,0], points[:,1], f)
-
+        interval0.error_func = self.error_func
+        
         points = np.array([[self.x_max, self.y_min],
                            [self.x_max, self.y_max],
                            [self.x_min, self.y_max]])
         interval1 = Interval2D.from_outer_triangle(points[:,0], points[:,1], f)
-
+        interval1.error_func = self.error_func
+        
         n_initial_points = 7*2 - 3 #3 points are shared between the two
 
         hash_list, init_points = self.get_unique_points([interval0, interval1])
@@ -317,12 +345,13 @@ class AdaptiveSampler2D():
         self.n_evaluations += f.shape[0]
         self.intervals = []
         self.errors = []
-
+        self.areas = []
                 
-        self.update_intervals([interval0, interval1], hash_list, f)
+        self.update_intervals([interval0, interval1])
         for interval in [interval0, interval1]:
             self.intervals.append(interval)
             self.errors.append(interval.estimate_error())
+            self.areas.append(interval.area())
 
         #self.intervals = [Interval(x_init, y_init)]
         #self.errors = [self.intervals[0].estimate_error()]
@@ -333,23 +362,24 @@ class AdaptiveSampler2D():
                            [self.x_min, self.y_min]])
         f = np.full(3, np.nan)
         interval0 = Interval2D.from_outer_triangle(points[:,0], points[:,1], f)
-
+        interval0.error_func = self.error_func
         n_initial_points = 7 
 
         hash_list, init_points = self.get_unique_points([interval0])
-        print(len(hash_list))
+        #print(len(hash_list))
         
         f = self.evaluate_function(init_points[:,0], init_points[:,1])        
         self.update_global_maps(hash_list, init_points, f)        
-        print(len(self.global_hash_map))
+        #print(len(self.global_hash_map))
         self.n_evaluations += f.shape[0]
         self.intervals = []
         self.errors = []
-                
-        self.update_intervals([interval0], hash_list, f)
+        self.areas = []
+        self.update_intervals([interval0])
         for interval in [interval0]:
             self.intervals.append(interval)
             self.errors.append(interval.estimate_error())
+            self.areas.append(interval.area())
 
 
     def init_from_intervals(self, interval_arrays):
@@ -365,14 +395,19 @@ class AdaptiveSampler2D():
             #points = np.vstack(points)
             #f_vals = np.array(f_vals)
             interval = Interval2D(x, y, f_vals)
+            interval.error_func = self.error_func
             hash_list, new_points = self.get_unique_points([interval])
-            sliced_f_vals = f_vals[list(interval.hash_map.values())]
-            
-            
+            sliced_f_vals = []
+            for hash_val in hash_list:
+                interval_index = interval.hash_map[hash_val]
+                sliced_f_vals.append(interval.f[interval_index])
+            sliced_f_vals = np.array(sliced_f_vals)
+            #sliced_f_vals = f_vals[list(interval.hash_map.values())]                        
             self.update_global_maps(hash_list, new_points, sliced_f_vals)
-            self.update_intervals([interval], hash_list, sliced_f_vals)
+            self.update_intervals([interval])
             self.intervals.append(interval)
             self.errors.append(interval.estimate_error())
+            self.areas.append(interval.area())
 
     def evaluate_function(self, x, y):
         return self.function(x, y)
@@ -386,13 +421,40 @@ class AdaptiveSampler2D():
         #print("initial remaining budget: {}".format(remaining_budget))
         step = 0
         debug = False
+        info = False
         while remaining_budget > 0:
-            print("########## Step {} #############".format(step))
+            if info:
+                print("########## Step {} #############".format(step))
             error_array = np.array(self.errors)
+            areas_array = np.array(self.areas)           
+
+            largest_area = np.amax(areas_array)
+            median_area = np.median(areas_array)
+            #if largest_area > median_area*25:
+            #    refinement_strategy = 'area'
+            #    sort_args = np.argsort(areas_array)[::-1]                
+            #else:
+            #    refinement_strategy = 'error'
+            #    sort_args = np.argsort(error_array)[::-1]
+            refinement_strategy = self.strategy 
+            #refinement_strategy= 'error'
+            if refinement_strategy == 'mix':
+                sort_args = np.argsort(np.sqrt(areas_array)*error_array)[::-1]
+            elif refinement_strategy == 'error':
+                sort_args = np.argsort(error_array)[::-1]
+            
+            mean_error = np.mean(error_array)
+            std_dev_error = np.std(error_array)
+            rms_error = np.sqrt(np.mean(error_array**2))
+            if info:
+                print("area ratio: {:.7e}".format(largest_area/median_area))
+                print("rms error: {:.7e}".format(rms_error))
+                print("std error: {:.7e}".format(std_dev_error/mean_error))
             if debug:
+                print("refinement step: {}".format(refinement_strategy))                
                 print("error array: {}".format(error_array))
-                print("n intervals: {}".format(len(self.intervals)))                
-            sort_args = np.argsort(error_array)[::-1]
+                print("n intervals: {}".format(len(self.intervals)))            
+            
             self.intervals = np.array(self.intervals)[sort_args].tolist()
             max_evaluations = np.min([n_parallel, remaining_budget])
             if debug:
@@ -404,47 +466,47 @@ class AdaptiveSampler2D():
                 if debug:
                     print("i : {}".format(i_int))
                 interval = self.intervals[i_int]
-                #interval = self.intervals.pop(0)
-                new_intervals = interval.split()
-                #self.intervals.extend(new_intervals)
+                if interval.estimate_error() <= self.tol:
+                    break
+                new_intervals = interval.split()                
                 if debug:
                     print("len(new_intervals): {}".format(len(new_intervals)))
                 candidate_new_intervals = total_new_intervals + new_intervals
                 hash_list, to_evaluate = self.get_unique_points(candidate_new_intervals)
-                #print("hash list: {}".format(hash_list))
-                for hash_val in hash_list:
-                    if hash_val in self.global_hash_map:
-                        print("doubled hash value: {}".format(hash_val))
                 if debug:
-                    print("new_points_required: {}, max_evals: {}".format(len(total_hash_list) + len(hash_list), max_evaluations))
-                if len(total_hash_list) + len(hash_list) > max_evaluations:
+                    print("new_points_required: {}, max_evals: {}".format(len(hash_list), max_evaluations))
+                if len(hash_list) > max_evaluations:
                     i_int -= 1
-                    print("cannot split interval, too few evaluations")
+                    if debug:
+                        print("cannot split interval, too few evaluations")
                     break
                 total_new_intervals = candidate_new_intervals
                 total_hash_list = hash_list                
                 total_to_evaluate = to_evaluate
-                if len(total_hash_list) > max_evaluations:
-                    i_int -= 1
-                    print("hash list larger than max evaluations")
-                    break
+                #if len(total_hash_list) > max_evaluations:
+                #    i_int -= 1
+                #    print("hash list larger than max evaluations")
+                #    break
             if len(total_hash_list) == 0:
-                print("not enough parallel evaluations allowed, need at least {} for refinemnet".format(len(hash_list)))                
+                if debug:
+                    print("not enough parallel evaluations allowed, need at least {} for refinemnet".format(len(hash_list)))                
                 break
-            #print("to evaluate: {}".format(to_evaluate))
-            print("# new evaluations: {}".format(total_to_evaluate.shape[0]))
-            #print("# new evaluations: {}".format(len(total_hash_list)))          
+            if debug:
+                print("# new evaluations: {}".format(total_to_evaluate.shape[0]))
+
+            #to_evaluate = np.array(to_evaluate)
             if remaining_budget - len(total_hash_list) <0:
                 print("terminating due to simulation budget mid step")
                 break
-            else:
-                for j in range(i_int+1):
-                    self.intervals.pop(0)
-                #print("# new intervals: {}".format(len(total_new_intervals)))
-                print("len(total_new_intervals): {}".format(len(total_new_intervals)))                
-                self.intervals.extend(total_new_intervals)
-            #to_evaluate = np.array(to_evaluate)
             f_vals = self.evaluate_function(total_to_evaluate[:,0], total_to_evaluate[:,1])
+            
+            for j in range(i_int+1):
+                self.intervals.pop(0)
+            #print("# new intervals: {}".format(len(total_new_intervals)))
+            if debug:
+                print("len(total_new_intervals): {}".format(len(total_new_intervals)))                
+            self.intervals.extend(total_new_intervals)
+            
             self.n_evaluations += f_vals.shape[0]
             if debug:
                 print("len(global_hash): {}".format(len(self.global_hash_map)))                
@@ -452,12 +514,15 @@ class AdaptiveSampler2D():
             self.update_global_maps(total_hash_list, total_to_evaluate, f_vals)
             if debug:
                 print("len(global_hash): {}".format(len(self.global_hash_map)))
-            self.update_intervals(total_new_intervals, total_hash_list, f_vals)
+            self.update_intervals(total_new_intervals)
             
             errors = np.zeros(len(self.intervals))
+            areas = np.zeros(len(self.intervals))
             for i_int, interval in enumerate(self.intervals):
                 errors[i_int] = interval.estimate_error()
+                areas[i_int] = interval.area()
             self.errors = errors
+            self.areas = areas
             step += 1
             n_evaluations += len(total_to_evaluate)
             remaining_budget -= len(total_to_evaluate)            
@@ -468,7 +533,7 @@ class AdaptiveSampler2D():
                 remaining_budget = 0
                 break
             if np.max(errors) < self.tol:
-                #print("terminating due to error tolerance")
+                print("terminating due to error tolerance")
                 #print(self.tol)
                 #print(errors)
                 break
@@ -478,15 +543,17 @@ class AdaptiveSampler2D():
         if grid_type == 'three_point':
             max_row = 3
         elif grid_type == 'six_point':
-            max_row = 5
+            max_row = 6
         elif grid_type == 'seven_point':
             max_row = 7
         points = []
         values = []
+        weights = []
         global_triangles = []
         vertex_index = 0
         hashed_vals = {}
         all_hashed_vals = set()
+
         for i_int, interval in enumerate(self.intervals):
             #print("########## Interval {} ########".format(i_int))
             if grid_type == 'three_point':
@@ -501,7 +568,7 @@ class AdaptiveSampler2D():
                 tri_list = [[] for _ in range(local_triangles.shape[0])]
             for hash_val, row in interval.hash_map.items():
                 all_hashed_vals.add(hash_val)
-                if row > max_row:
+                if row >= max_row:
                     continue
                 
                 if hash_val not in hashed_vals:
@@ -524,16 +591,23 @@ class AdaptiveSampler2D():
         if grid_type == 'seven_point':
             triangles = scipy.spatial.Delaunay(grid).simplices
         else:
-            triangles = np.array(global_triangles)
+            triangles = np.vstack(global_triangles)
         return grid, f_vals, triangles                                       
     
     def interpolate(self, x, y):
         values = np.zeros(x.size)
+        idx = rindex.Index()
+        for ii, interval in enumerate(self.intervals):
+            idx.insert(ii, interval.bounding_box())
+        
         for ix in range(x.size):
             x_val = x[ix]
             y_val = y[ix]
             xy = np.array([x_val, y_val])
-            for i_int, interval in enumerate(self.intervals):
+            query = [x_val, y_val, x_val, y_val]
+            indices = list(idx.intersection(query))
+            for index in indices:
+                interval = self.intervals[index]
                 if interval.contains(xy):
                     values[ix] = interval.interpolate(xy)
                     break
@@ -559,7 +633,7 @@ class AdaptiveSampler2D():
             tri_list = [[]]            
             for hash_val, row in interval.hash_map.items():
                 all_hashed_vals.add(hash_val)
-                if row > max_row:
+                if row >= max_row:
                     continue                
                 if hash_val not in hashed_vals:
                     point = interval.x[row], interval.y[row]
@@ -575,10 +649,73 @@ class AdaptiveSampler2D():
                         if row in local_triangles[t_row, :]:
                             tri_list[t_row].append(hashed_vals[hash_val])
             global_triangles += tri_list
-            error_vals.append(interval.estimate_error())
+            error_vals.append(interval.estimate_error()*np.sqrt(interval.area()))
         self._all_hashed_vals = all_hashed_vals
         grid = np.array(points)
         error = np.array(error_vals)
         #f_vals = np.array(values)        
         triangles = np.array(global_triangles)
-        return grid, error, triangles                                       
+        return grid, error, triangles
+
+    def get_grid_weights(self, grid_type='six_point'):
+        if grid_type == 'three_point':
+            max_row = 3
+            weight_fraction=1./3.
+        elif grid_type == 'six_point':
+            max_row = 6
+            weight_fraction=1./6.            
+        elif grid_type == 'seven_point':
+            max_row = 7
+        points = []
+        weights = []
+        global_triangles = []
+        vertex_index = 0
+        hashed_vals = {}
+        all_hashed_vals = set()
+
+        global_area = (self.x_max-self.x_min)*(self.y_max-self.y_min)*0.5
+        
+        for i_int, interval in enumerate(self.intervals):
+            #print("########## Interval {} ########".format(i_int))
+            interval_area = interval.area()
+            if grid_type == 'three_point':
+                local_triangles = interval.big_triangle()
+                tri_list = [[]]
+            elif grid_type == 'six_point':
+                local_triangles = interval.small_triangles()
+                tri_list = [[],[],[],[]]
+            elif grid_type == 'seven_point':
+                local_grid = np.vstack([interval.x, interval.y]).T
+                local_triangles = scipy.spatial.Delaunay(local_grid).simplices
+                tri_list = [[] for _ in range(local_triangles.shape[0])]
+
+            for hash_val, row in interval.hash_map.items():
+                all_hashed_vals.add(hash_val)
+                if row >= max_row:
+                    continue
+                
+                if hash_val not in hashed_vals:
+                    point = interval.x[row], interval.y[row]
+                    points.append(point)
+                    weights.append(interval_area*weight_fraction/global_area)
+                    hashed_vals[hash_val] = vertex_index
+                    for t_row in range(local_triangles.shape[0]):
+                        if row in local_triangles[t_row, :]:
+                            tri_list[t_row].append(vertex_index)
+                    vertex_index += 1
+                else:
+                    for t_row in range(local_triangles.shape[0]):
+                        if row in local_triangles[t_row, :]:
+                            tri_list[t_row].append(hashed_vals[hash_val])
+                    current_vertex_index = hashed_vals[hash_val]
+                    weights[current_vertex_index] += interval_area*weight_fraction/global_area
+            global_triangles += tri_list
+        self._all_hashed_vals = all_hashed_vals
+        #self._hashed_vals = hashed_vals
+        grid = np.array(points)
+        weights = np.array(weights)
+        if grid_type == 'seven_point':
+            triangles = scipy.spatial.Delaunay(grid).simplices
+        else:
+            triangles = np.vstack(global_triangles)
+        return grid, weights, triangles     
